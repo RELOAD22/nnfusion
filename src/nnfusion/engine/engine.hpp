@@ -103,8 +103,13 @@ namespace nnfusion
         bool run_on_graph(graph::Graph::Pointer graph, EngineContext::Pointer context = nullptr);
 
     protected:
+        // Split m_passes into two parts: codegen pass and other passes.
         InterpreterPassManager::Pointer m_passes;
+        InterpreterPassManager::Pointer m_codegen_pass;
+
+        // Split g_passes into two parts: prefetch pass and other passes.
         GraphPassManager::Pointer g_passes;
+        GraphPassManager::Pointer g_prefetch_pass;
         GraphVisitor::Pointer g_visitor;
     };
 } // namespace nnfusion

@@ -19,7 +19,7 @@ using namespace nnfusion::pass::graph;
 using namespace nnfusion::profiler;
 
 DEFINE_bool(fprefetch,
-            true,
+            false,
             "Enable prefetching for tensors, only works for CUDA GPU backend.");
 
 // function parameter class

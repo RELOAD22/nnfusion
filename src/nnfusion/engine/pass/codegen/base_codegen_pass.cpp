@@ -18,8 +18,8 @@ bool BaseCodegenPass::run(std::shared_ptr<InterpreterContext> ctx,
                           std::shared_ptr<TranslationUnit> tu)
 {
     initialize(ctx, tu);
-    NNFUSION_CHECK(collect_mem(ctx, tu));
     NNFUSION_CHECK(collect_stream(ctx, tu));
+    NNFUSION_CHECK(collect_mem(ctx, tu));
     NNFUSION_CHECK(collect_funcs(ctx, tu));
     NNFUSION_CHECK(modify_codegen());
 

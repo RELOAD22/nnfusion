@@ -124,7 +124,7 @@ public:
     LanguageUnit_p emit_event_record(shared_ptr<Event> event) override;
     virtual LanguageUnit_p emit_stream_destroy();
     virtual LanguageUnit_p emit_event_destroy();
-
+    std::string get_stream_name();
 protected:
     DeviceStreamAsyncManager(std::shared_ptr<nnfusion::graph::Graph> graph)
         : AsyncManager(graph)

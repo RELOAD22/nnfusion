@@ -536,3 +536,16 @@ DeviceStreamAsyncManager* AsyncManagerFactory::get_device_stream_async_manager(
         return device_stream_async_manager;
     }
 }
+
+std::string DeviceStreamAsyncManager::get_stream_name(){
+    for (auto& info : m_dev_stream)
+    {
+        for (auto stream : info.second)
+        {
+            if (!stream->is_default_stream())
+            {
+                return stream->get_name();
+            }
+        }
+    }
+}

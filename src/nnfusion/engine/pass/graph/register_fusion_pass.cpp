@@ -431,6 +431,8 @@ public:
             shared_ptr<KernelContext> ctx(new KernelContext(fused_node));
             (*fused_node)["Kernel_Selection_Result"] = std::make_pair<NNFusion_DeviceType, KernelEmitter::Pointer>(
                 nnfusion::get_device_type(FLAGS_fdefault_device.c_str()), make_shared<cuda::FusionCudaEmitter>(ctx, group));
+            (*fused_node)["Kernel_Selection_Result_DeviceType"] = FLAGS_fdefault_device.c_str();
+            (*fused_node)["Kernel_Selection_Result_json"] = group;
         }
         return true;
     }

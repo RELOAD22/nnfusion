@@ -35,6 +35,10 @@ DECLARE_bool(fhost_entry);
 DECLARE_string(fantares_perf_file);
 DECLARE_bool(fcodegen_pybind);
 DECLARE_bool(ffunction_codegen);
+DECLARE_bool(fuse_default_stream);
+DEFINE_int64(fl2cache_persistent_size, 0, "Bytes of persistent memory in L2 cache, must enabled with fuse_default_stream=false.");
+DEFINE_bool(fflush_cache, false, "Flush cache before running kernels.");
+DEFINE_bool(fcuda_graph, false, "Use cuda graph to optimize kernels, must enabled with fuse_default_stream=false, warmup>0.");
 
 void CudaCodegenPass::set_global_member(std::shared_ptr<InterpreterContext> ctx,
                                         std::shared_ptr<TranslationUnit> tu)
@@ -367,6 +371,7 @@ bool CudaCodegenPass::collect_funcs(std::shared_ptr<InterpreterContext> ctx,
                            call_str.substr(pos_right + sizeof(">>>(") - 1);
 #endif
             }
+            NNFUSION_LOG(INFO) << "call_str: " << call_str;
             LanguageUnit_p kernel_func_call = func_call_codegen(ins, func_call_only, call_str);
             if (FLAGS_fcustomized_mem_imp)
                 lup_func_calls->unit_vec.push_back(get_customized_mem_imp(ins).first);
@@ -897,7 +902,7 @@ bool CudaCodegenPass::collect_mem(std::shared_ptr<InterpreterContext> ctx,
         total_alloc += allocator.second->max_allocated();
     }
     LanguageUnit_p total = std::make_shared<LanguageUnit>(
-        "total_memory", "// total memory:" + to_string(total_alloc) + "\n");
+        "total_memory", "// debug total memory:" + to_string(total_alloc) + "\n");
     lup_mem_alloc->unit_vec.push_back(total);
 
     std::regex r(R"(CUDA_SAFE_CALL\(cudaSetDevice\(\d)");
@@ -905,6 +910,10 @@ bool CudaCodegenPass::collect_mem(std::shared_ptr<InterpreterContext> ctx,
     size_t offset = 0;
     for (const auto& allocator : allocator_list)
     {
+        // debug allocator info
+        NNFUSION_LOG(INFO) << "allocator name: " << allocator.second->get_name();
+        NNFUSION_LOG(INFO) << "allocator max allocated: " << allocator.second->max_allocated();
+        
         auto init = allocator.second->emit_memory_init();
         auto alloc = allocator.second->emit_memory_alloc();
         auto free = allocator.second->emit_memory_free();
@@ -928,6 +937,42 @@ bool CudaCodegenPass::collect_mem(std::shared_ptr<InterpreterContext> ctx,
         }
         lup_mem_alloc->unit_vec.push_back(alloc_lu);
         lup_mem_alloc->require(init);
+        if (FLAGS_fl2cache_persistent_size > 0 && FLAGS_fuse_default_stream == false)
+        {
+            // "persist" not in allocator symbol
+            if (alloc->get_symbol().find("persist") == std::string::npos)
+            {
+                size_t persistent_size = min((size_t)FLAGS_fl2cache_persistent_size,
+                                             allocator.second->max_allocated());
+                
+                NNFUSION_LOG(INFO) << "l2cache persistent size: " << persistent_size;
+                std::string l2cache_alloc_code = "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, " +
+                                                 std::to_string(persistent_size) +
+                                                 ");\n";
+                l2cache_alloc_code += "cudaStreamAttrValue stream_attribute_thrashing;\n";
+                l2cache_alloc_code +=
+                    "stream_attribute_thrashing.accessPolicyWindow.base_ptr = "
+                    "reinterpret_cast<void*>(" +
+                    allocator.second->get_name() + "_memory_pool" + ");\n";
+                l2cache_alloc_code +=
+                    "stream_attribute_thrashing.accessPolicyWindow.num_bytes = " +
+                    std::to_string(persistent_size) + ";\n";
+                l2cache_alloc_code += "stream_attribute_thrashing.accessPolicyWindow.hitRatio = 1.0;\n";
+                l2cache_alloc_code +=
+                    "stream_attribute_thrashing.accessPolicyWindow.hitProp = "
+                    "cudaAccessPropertyPersisting;\n";
+                l2cache_alloc_code += "stream_attribute_thrashing.accessPolicyWindow.missProp = "
+                                      "cudaAccessPropertyStreaming;\n";
+                std::string stream_name = device_async_manager->get_stream_name();
+                l2cache_alloc_code += "cudaStreamSetAttribute(" +
+                                        stream_name +
+                                        ", cudaStreamAttributeAccessPolicyWindow, "
+                                        "&stream_attribute_thrashing);\n";
+                LanguageUnit_p l2cache_alloc_lu(new LanguageUnit("l2cache_alloc", l2cache_alloc_code));
+                lup_mem_alloc->unit_vec.push_back(l2cache_alloc_lu);
+            }
+        }
+
         lup_mem_free->unit_vec.push_back(free_lu);
         lup_mem_free->require(init);
     }
@@ -1247,6 +1292,13 @@ void CudaCodegenPass::create_main_file(std::shared_ptr<InterpreterContext> ctx,
             }
         }
 
+        if (FLAGS_fflush_cache)
+        {
+            lu_main << "\n//flush arguments\n";
+            lu_main << "char* Flush_0;\n";
+            lu_main << "CUDA_SAFE_CALL(cudaMalloc((void**)&Flush_0, 134217728));\n";
+        }
+
         lu_main << "\n// fill input values\n";
         lu_main << fillval.get_code() << "\n";
 
@@ -1255,6 +1307,15 @@ void CudaCodegenPass::create_main_file(std::shared_ptr<InterpreterContext> ctx,
         {
             warm_step = 0;
             test_step = 1;
+        }
+        std::string stream_name;
+        if (FLAGS_fcuda_graph && !FLAGS_fuse_default_stream && warm_step > 0){
+            lu_main << "\n//create cuda graph\n";
+            lu_main << "bool graphCreated = false;\n";
+            lu_main << "cudaGraph_t graph;\n";
+            lu_main << "cudaGraphExec_t instance;\n";
+            stream_name = device_async_manager->get_stream_name();
+            lu_main << "extern cudaStream_t " << stream_name << ";\n";
         }
         lu_main << "\n//warm up for 5 iters:\n";
         lu_main << "for(int i_=0; i_< " << warm_step << "; i_++)\n";
@@ -1269,7 +1330,19 @@ void CudaCodegenPass::create_main_file(std::shared_ptr<InterpreterContext> ctx,
         {
             args = get_kernel_entry_args(tu, false);
             lu_main << get_h2dcopy(tu)->get_code();
-            lu_main << "kernel_entry(" << args << ");\n";
+            if (FLAGS_fcuda_graph && !FLAGS_fuse_default_stream && warm_step > 0){
+                lu_main << "if(!graphCreated){\n";
+                lu_main << "cudaStreamBeginCapture(" << stream_name << ", cudaStreamCaptureModeGlobal);\n";
+                lu_main << "kernel_entry(" << args << ");\n";
+                lu_main << "cudaStreamEndCapture(" << stream_name << ", &graph);\n";
+                lu_main << "cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);\n";
+                lu_main << "graphCreated = true;\n";
+                lu_main << "}\n";
+                lu_main << "cudaGraphLaunch(instance, " << stream_name << ");\n";
+            }
+            else{
+                lu_main << "kernel_entry(" << args << ");\n";
+            }
             lu_main << get_d2hcopy(tu)->get_code();
             lu_main << get_sync()->get_code();
         }
@@ -1304,6 +1377,8 @@ void CudaCodegenPass::create_main_file(std::shared_ptr<InterpreterContext> ctx,
         lu_main << "for (int i_=0; i_<steps; i_++)\n";
         lu_main.block_begin();
 
+        if (FLAGS_fflush_cache)
+            lu_main << "cudaMemset(Flush_0, 0, 134217728);\n";
         lu_main << "cudaEventRecord(start_i, 0);\n";
         if (FLAGS_fhost_entry)
         {
@@ -1311,7 +1386,12 @@ void CudaCodegenPass::create_main_file(std::shared_ptr<InterpreterContext> ctx,
         }
         else
         {
-            lu_main << "kernel_entry(" << args << ");\n";
+            if (FLAGS_fcuda_graph && !FLAGS_fuse_default_stream && warm_step > 0){
+                lu_main << "cudaGraphLaunch(instance, " << stream_name << ");\n";
+            }
+            else{
+                lu_main << "kernel_entry(" << args << ");\n";
+            }
             // lu_main << get_d2hcopy(tu)->get_code();
             // lu_main << get_sync()->get_code();
         }
@@ -1387,7 +1467,7 @@ cmake_minimum_required(VERSION 3.5)
 
 SET(SRC "nnfusion_rt.cu" CACHE STRING "codegen source file")
 SET(TARGET_NAME "nnfusion_naive_rt" CACHE STRING "codegen target name")
-SET(CUDA_ARCH "-gencode=arch=compute_70,code=compute_70 -gencode=arch=compute_75,code=compute_75" CACHE STRING "target architecture")
+SET(CUDA_ARCH "-gencode=arch=compute_70,code=compute_70 -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_80,code=compute_80" CACHE STRING "target architecture")
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
