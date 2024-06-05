@@ -168,5 +168,6 @@ bool CSEPass::run_on_graph(std::shared_ptr<Graph>& graph)
             expressions.insert(make_pair(n_key, n));
         }
     }
+    NNFUSION_LOG(INFO) << "CSEPass done";
     return true;
 }

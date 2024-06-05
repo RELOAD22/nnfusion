@@ -107,6 +107,7 @@ private:
         std::unordered_set<shared_ptr<GNode>> fused;
         std::queue<std::shared_ptr<GNode>> ready;
 
+        NNFUSION_LOG(INFO) << "IR-based Fusion: " << tn->get_name();
         // find fusing nodes
         ready.push(tn);
         while (!ready.empty())
@@ -127,6 +128,7 @@ private:
         // fuse
         if (fused.size() > 1)
         {
+            NNFUSION_LOG(INFO) << "Fusing " << fused.size() << " nodes";
             auto fused_op =
                 std::make_shared<nnfusion::op::Fused>("fused_kernel", "Matched_Pattern");
             auto fused_node = std::make_shared<FusedGNode>(fused_op);

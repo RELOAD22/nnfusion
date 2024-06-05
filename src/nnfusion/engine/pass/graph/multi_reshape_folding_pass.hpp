@@ -127,6 +127,7 @@ namespace nnfusion
                         }
                     }
 
+                    NNFUSION_LOG(INFO) << "MultiReshapeFoldingPass End";
                     return true;
                 }
             };

@@ -17,6 +17,10 @@ int RuntimeConstantFoldingPass::runtime_const_folding_iterate_once(
     std::set<std::shared_ptr<GNode>> const_nodes = {};
     std::set<std::shared_ptr<GNode>> down_streams = {};
 
+    NNFUSION_LOG(INFO) << ">> Iterating Runtime Constant Folding Pass for Graph: " << graph->get_name()
+                       << ", Node Count = " << nodes.size() << ", Blocklist Node Count = "
+                       << blocklist_nodes.size() << ", Backend = " << this->backend << ", Fast Debug = "
+                       << this->fast_debug << ".";
     // Find nodes with all constant upstream nodes
     for (auto& it : nodes)
     {
@@ -54,6 +58,7 @@ int RuntimeConstantFoldingPass::runtime_const_folding_iterate_once(
         }
     }
 
+    NNFUSION_LOG(INFO) << ">> Found constant nodes: " << const_nodes.size();
     for (auto& it : down_streams)
     {
         NNFUSION_LOG(INFO) << ">> Found constant downstream node: " << it->get_name()
@@ -96,6 +101,7 @@ int RuntimeConstantFoldingPass::runtime_const_folding_iterate_once(
         if (is_memcpy) {
             raw_outputs = raw_inputs;
             const_infer_success = true;
+            NNFUSION_LOG(INFO) << "  Reshape with no layout change, skip runtime inference.";
         } else {
             // Prepare runtime backend
             nnfusion::profiler::IProfilingRuntime::Pointer runtime = nullptr;
@@ -129,6 +135,8 @@ int RuntimeConstantFoldingPass::runtime_const_folding_iterate_once(
             {
                 NNFUSION_CHECK_FAIL() << "Cannot Recognize Backend Type: " << backend;
             }
+            NNFUSION_LOG(INFO) << "  Backend: " << backend << ", Kernel Registrations: "
+                               << kernel_regs.size();
 
             // Runtime node output inference
             shared_ptr<KernelContext> ctx(new KernelContext(it));

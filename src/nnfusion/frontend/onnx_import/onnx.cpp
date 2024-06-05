@@ -75,6 +75,7 @@ namespace nnfusion
                 dim_params_str += "}\'";
                 cmd += dim_params_str;
             }
+            NNFUSION_LOG(INFO) << "Running ONNX optimization command: " << cmd;
             int sys_ret = system(cmd.c_str());
             std::ifstream opt_fin(optimized_filename.c_str());
             if (sys_ret == 0 && opt_fin.is_open())
