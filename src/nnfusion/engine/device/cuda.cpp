@@ -34,6 +34,7 @@
 #include "nnfusion/engine/pass/graph/vector_dot_transpose_pass.hpp"
 #include "nnfusion/engine/pass/graph/remove_redundant_ops.hpp"
 #include "nnfusion/engine/pass/graph/prefetch_pass.hpp"
+#include "nnfusion/engine/pass/graph/prefetch_oracle_pass.hpp"
 
 #include "nnfusion/engine/pass/extract_graph_signature.hpp"
 #include "nnfusion/engine/pass/tensor/inplace_tensor_analysis.hpp"
@@ -98,8 +99,8 @@ CudaEngine::CudaEngine()
     g_passes->push_back(make_shared<AssignAsyncInfoPass>());
 
     // Prefetch
+    // g_passes->push_back(make_shared<PrefetchOraclePass>());
     g_passes->push_back(make_shared<PrefetchPass>());
-    NNFUSION_LOG(INFO) << "Prefetch Done";
 
     // Visitor
     g_visitor = make_shared<ReversedDFSVisitor>();

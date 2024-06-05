@@ -14,6 +14,7 @@ using namespace nnfusion::pass::graph;
 DECLARE_string(ftune_output_file);
 DECLARE_string(ffusion_skiplist);
 DECLARE_bool(ftc_rewrite);
+DEFINE_bool(fdot_algo_select, true, "Enable DotAlgoSelectPass");
 
 const int kSM = 80; // For V100
 
@@ -36,7 +37,7 @@ bool DotAlgoSelectPass::run_on_graph(std::shared_ptr<Graph>& graph)
 {
     NNFUSION_LOG(INFO) << "DotAlgoSelectPass Start";
     parse_skip_ops();
-    if (FLAGS_ftune_output_file == "" || skip_ops.count("Dot"))
+    if (FLAGS_ftune_output_file == "" || skip_ops.count("Dot") || !FLAGS_fdot_algo_select)
         return true;
     for (auto node : graph->get_ordered_ops()) {
         if (node->get_op_type() == "Dot") {
@@ -48,6 +49,10 @@ bool DotAlgoSelectPass::run_on_graph(std::shared_ptr<Graph>& graph)
             for (auto n: out_shape) num_output_elem *= n;
             size_t split_k_factor = 4;
             if (k % split_k_factor == 0 && num_output_elem / (64 * 64) < kSM && k/split_k_factor>=32) {
+                NNFUSION_LOG(INFO) << "DotAlgoSelectPass: " << node->get_name() << ", num_output_elem: " << num_output_elem
+                                    << ", num_output_elem/(64*64): " << num_output_elem / (64 * 64)
+                                    << ", k: " << k << ", split_k_factor: " << split_k_factor
+                                    << ", k/split_k_factor: " << k/split_k_factor;
                 op::OpConfig::any config;
                 config["split_k_factor"] = split_k_factor;
                 config["transpose_A"] = op->get_transpose_A();

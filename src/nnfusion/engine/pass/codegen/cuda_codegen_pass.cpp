@@ -12,6 +12,7 @@
 #include "nnfusion/core/kernels/cuda_gpu/cuda_langunit.hpp"
 #include "nnfusion/core/kernels/kernel_emitter.hpp"
 #include "nnfusion/core/kernels/kernel_registration.hpp"
+#include "nnfusion/core/kernels/cuda_gpu/cuda_emitter.hpp"
 
 #include <regex>
 
@@ -20,6 +21,7 @@ using namespace nnfusion::graph;
 using namespace nnfusion::kernels;
 using namespace nnfusion::codegen;
 using namespace nnfusion::async;
+using namespace nnfusion::kernels::cuda;
 
 DEFINE_bool(fcodegen_debug, false, "Add debug functions in Codegen-ed project.");
 DECLARE_string(fdefault_device);
@@ -39,7 +41,9 @@ DECLARE_bool(fuse_default_stream);
 DEFINE_int64(fl2cache_persistent_size, 0, "Bytes of persistent memory in L2 cache, must enabled with fuse_default_stream=false.");
 DEFINE_bool(fflush_cache, false, "Flush cache before running kernels.");
 DEFINE_bool(fcuda_graph, false, "Use cuda graph to optimize kernels, must enabled with fuse_default_stream=false, warmup>0.");
+DEFINE_bool(fprefetch_oracle, false, "Use prefetch oracle to optimize kernels, must enabled with fprefetch=false.");
 
+#define ORACLE_PREFETCH_SIZE 20 * 1024 * 1024
 void CudaCodegenPass::set_global_member(std::shared_ptr<InterpreterContext> ctx,
                                         std::shared_ptr<TranslationUnit> tu)
 {
@@ -278,6 +282,8 @@ bool CudaCodegenPass::collect_funcs(std::shared_ptr<InterpreterContext> ctx,
 
         bool func_call_only = (main_block == "init");
 
+        // set for visited string func_name
+        std::set<std::string> setattribute_funcs;
         for (auto ins : it.second)
         {
             auto kernel = ins->getKernel();
@@ -371,10 +377,51 @@ bool CudaCodegenPass::collect_funcs(std::shared_ptr<InterpreterContext> ctx,
                            call_str.substr(pos_right + sizeof(">>>(") - 1);
 #endif
             }
-            NNFUSION_LOG(INFO) << "call_str: " << call_str;
+
+            if (std::dynamic_pointer_cast<FusionCudaEmitter>(kernel) != nullptr) {
+                size_t dynamic_smem_size = std::dynamic_pointer_cast<FusionCudaEmitter>(kernel)->get_dynamic_smem_size();
+                if (dynamic_smem_size > 0){
+                    // func_name<<<*, *, 0, *>>>(*); -> func_name<<<*, *, dynamic_smem_size, *>>>(*);
+                    NNFUSION_LOG(INFO) << "call_str: " << call_str;
+                    std::string dynamic_smem_size_str = std::to_string(dynamic_smem_size);
+                    int pos = call_str.find(", 0, ");
+                    call_str.replace(pos, 5, ", " + dynamic_smem_size_str + ", ");
+                    NNFUSION_LOG(INFO) << "new_call_str: " << call_str;
+                    // func_name not in the setattribute_funcs
+                    if (setattribute_funcs.find(func_name) == setattribute_funcs.end()){
+                        setattribute_funcs.insert(func_name);
+                        std::string setattribute_call = "cudaFuncSetAttribute(" + func_name + ", cudaFuncAttributeMaxDynamicSharedMemorySize, " + dynamic_smem_size_str + ");\n";
+                        LanguageUnit_p setattribute_func_call(new LanguageUnit("setattribute", setattribute_call));
+                        lup_func_calls->unit_vec.push_back(setattribute_func_call);
+                    }
+                }
+            }
             LanguageUnit_p kernel_func_call = func_call_codegen(ins, func_call_only, call_str);
             if (FLAGS_fcustomized_mem_imp)
                 lup_func_calls->unit_vec.push_back(get_customized_mem_imp(ins).first);
+            if (FLAGS_fprefetch_oracle){
+                lup_func_calls->require(declaration::cuda_prefetch);
+                // void PreFetchKernel(const void *__ptr, const std::size_t __nbytes, size_t blockcount, size_t threadcount, cudaAccessProperty prop, cudaStream_t stream)
+                // prefetch the input of the kernel
+                size_t total_prefetch_size = 0;
+                for (size_t i = 0; i < gnode->get_in_edges().size(); i++) {
+                    if (total_prefetch_size > ORACLE_PREFETCH_SIZE)
+                        break;
+                    std::string in_name = gnode->get_input_tensor(i).get_name();
+                    if (in_name.find("tensor_") != std::string::npos)
+                        continue;
+                    auto in_tensor = gnode->get_input_tensor_ptr(i);
+                    size_t in_size = in_tensor->size();
+                    total_prefetch_size += in_size;
+                    if (total_prefetch_size > ORACLE_PREFETCH_SIZE){
+                        in_size = in_size - (total_prefetch_size - ORACLE_PREFETCH_SIZE);
+                    }
+                    std::string stream_name = device_async_manager->get_stream_name();
+                    std::string prefetch_call = "PreFetchKernel(" + in_name + ", " + std::to_string(in_size) + ", 216, 1024, cudaAccessPropertyNormal, " + stream_name + ");\n";
+                    LanguageUnit_p prefetch_func_call(new LanguageUnit("prefetch", prefetch_call));
+                    lup_func_calls->unit_vec.push_back(prefetch_func_call);
+                }
+            }
             lup_func_calls->unit_vec.push_back(kernel_func_call);
             if (FLAGS_fcustomized_mem_imp)
                 lup_func_calls->unit_vec.push_back(get_customized_mem_imp(ins).second);

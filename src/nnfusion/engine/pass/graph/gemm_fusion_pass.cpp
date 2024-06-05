@@ -101,6 +101,8 @@ public:
             }
         }
 
+        NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                           << ", found " << merge_groups.size() << " groups.";
         // Step 2: extract the dependencies among all candidates of each group.
         std::unordered_map<int, TaggedNode> tagged_nodes;
         tagged_nodes.clear();
@@ -115,6 +117,8 @@ public:
         }
         ExtractDependencies(tagged_nodes);
 
+        NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                           << ", extracted dependencies.";
         // Step 3: for each candidate_group, partition the candidate nodes into
         // independent sub-groups, where each sub-group can be merged to one operator
         // (TODO) currently, we take a very naive partition method.
@@ -171,14 +175,31 @@ public:
             }
         }
 
+        NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                           << ", partitioned sub-groups.";
         // Step4: for each sub-group that can be merged, we merge them into one
         // new "MatMul" operator with an additional "Concat" operator and a "Split" Operator.
         int merge_before = 0;
         int merge_after = 0;
+        NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                           << ", merging " << merge_groups.size() << " groups." ;
         for (auto group : merge_groups)
         {
+            NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                               << ", groupid: " << group->groupid << ", can_merge: " << group->can_merge
+                               << ", sub_groups: " << group->sub_groups.size();
             for (auto subgroup : group->sub_groups)
             {
+                NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                   << ", merging " << subgroup.size() << " Dot ops.";
+                for (auto node : subgroup)
+                {
+                    NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                       << ", node: " << node->get_name() << ", depth: " 
+                                       << tagged_nodes[node->get_id()].depth << ", depends: "
+                                        << tagged_nodes[node->get_id()].depends.size() 
+                                        << ", groupid: " << tagged_nodes[node->get_id()].groupid;
+                }
                 if (MergeIntoOneInplace(subgroup))
                 {
                     changed = true;
@@ -188,6 +209,8 @@ public:
             }
         }
 
+        NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                           << ", merged " << merge_before << " Dot ops into " << merge_after;
         if (changed)
         {
             NNFUSION_LOG(INFO) << "[NNFusion] GEMM Fusion: round " << m_rounds << ", merged "
@@ -329,10 +352,15 @@ private:
 
         for (auto gnode : nodes)
         {
+            NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                               << ", merging node: " << gnode->get_name();
             std::shared_ptr<GNode> src_gnode = nullptr;
             int src_output_idx = -1;
             for (auto edge : gnode->get_in_edges())
             {
+                NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                   << ", merging node: " << gnode->get_name()
+                                   << ", input: " << edge->get_dst_input();
                 if (edge->get_dst_input() == in_idx)
                 {
                     src_gnode = edge->get_src();
@@ -342,10 +370,16 @@ private:
             }
             if (src_gnode)
             {
+                NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                   << ", merging node: " << gnode->get_name()
+                                   << ", src_gnode: " << src_gnode->get_name();
                 auto dot_op = std::dynamic_pointer_cast<nnfusion::op::Dot>(gnode->get_op_ptr());
                 std::shared_ptr<GNode> reshape_node = nullptr;
                 if (dot_op && in_idx == 1)
                 {
+                    NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                       << ", merging node: " << gnode->get_name()
+                                       << ", transpose_A: " << dot_op->get_transpose_A();
                     same_operand_transpose = dot_op->get_transpose_A();
                     if (dot_op->get_transpose_B())
                     {
@@ -355,6 +389,9 @@ private:
                 }
                 else if (dot_op && in_idx == 0)
                 {
+                    NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                       << ", merging node: " << gnode->get_name()
+                                       << ", transpose_B: " << dot_op->get_transpose_B();
                     same_operand_transpose = dot_op->get_transpose_B();
                     if (dot_op->get_transpose_A())
                     {
@@ -363,9 +400,14 @@ private:
                     }
                 }
 
+                NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                   << ", merging node: " << gnode->get_name()
+                                   << ", reshape_node: " << (reshape_node ? reshape_node->get_name()
+                                                                         : "nullptr");
                 nnfusion::Shape shape;
                 if (reshape_node != nullptr)
                 {
+                    NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: ADD reshape_node: " << reshape_node->get_name();
                     m_graph->add_gnode_and_edge(
                         reshape_node, GNodeIndexVector({GNodeIndex(src_gnode, src_output_idx)}));
                     concat_inputs.push_back(GNodeIndex(reshape_node, 0));
@@ -377,6 +419,9 @@ private:
                     shape = src_gnode->get_output_shape(src_output_idx);
                 }
 
+                NNFUSION_LOG(DEBUG) << "[NNFusion] GEMM Fusion: round " << m_rounds
+                                   << ", merging node: " << gnode->get_name()
+                                   << ", shape: " << join(shape, ",");
                 if (in_idx == 1)
                 {
                     lengths.push_back(shape[1]);
@@ -509,6 +554,7 @@ bool GemmFusionPass::run_on_graph(std::shared_ptr<Graph>& graph)
     if (!enable_gemm_fusion)
         return true;
 
+    NNFUSION_LOG(INFO) << "GemmFusionPass Start";
     const int kMaxRounds = 10;
     bool changed = true;
 
@@ -523,8 +569,10 @@ bool GemmFusionPass::run_on_graph(std::shared_ptr<Graph>& graph)
             changed = true;
         }
 
+        break;
         if (!changed)
             break;
     }
+    NNFUSION_LOG(INFO) << "GemmFusionPass End";
     return true;
 }

@@ -35,6 +35,7 @@ set(SRC
     ir_based_fusion_pass.cpp
     subgraph_fusion_pass.cpp
     prefetch_pass.cpp
+    prefetch_oracle_pass.cpp
     
 )
 
