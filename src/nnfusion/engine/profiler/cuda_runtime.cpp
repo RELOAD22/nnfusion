@@ -56,6 +56,7 @@ bool CudaDefaultRuntime::codegen(const ProfilingContext::Pointer& ke)
     re->require(declaration::typedef_int);
     re->require(macro::HALF_MAX);
     re->require(header::cublas);
+    re->require(header::welder_cuda);
 
     for (auto& it : re->local_symbol)
     {
@@ -100,6 +101,15 @@ bool CudaDefaultRuntime::codegen(const ProfilingContext::Pointer& ke)
         auto position = symbol_name.find("dropout");
         dropout_prefix.insert(it.second->symbol.substr(position));
     }
+    // for device kernel: __device__
+    for (auto& it : re->local_symbol)
+    {
+        if (it.second->symbol.find("_device_kernel") != string::npos)
+        {
+            writer << it.second->get_code();
+        }
+    }
+    writer << "\n";
 
     std::string body_unit = fu->body_unit->get_code();
 
@@ -487,9 +497,14 @@ bool CudaDefaultRuntime::compile(const ProfilingContext::Pointer& ke)
     source_file << ke->source_code->get_code();
     source_file.close();
 
+    string compile_command = "nvcc -lcudnn -lcublas --compiler-options '-fPIC --shared' --cudart "
+                             "shared -O3 -gencode=arch=compute_80,code=compute_80 -std=c++11 "
+                             "--expt-relaxed-constexpr " +
+                             srcname + " -o " + objname;
+    NNFUSION_LOG(DEBUG) << "Complie command: " << compile_command;
     int ret = system(("nvcc\t-lcudnn\t-lcublas\t--compiler-options\t'-fPIC\t "
-                      "--shared'\t--cudart\tshared\t-O2\t-gencode="
-                      "arch=compute_60,code=compute_60\t-gencode=arch=compute_61,code=compute_61\t-"
+                      "--shared'\t--cudart\tshared\t-O3\t"
+                      "-gencode=arch=compute_80,code=compute_80\t-"
                       "std=c++11\t--expt-relaxed-constexpr\t" +
                       srcname + "\t-o\t" + objname)
                          .c_str());

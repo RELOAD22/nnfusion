@@ -125,6 +125,7 @@ private:
     double GroupProfiler(const std::shared_ptr<FusionGroup> group);
     bool SkipGroupOnProfilingResult(blockfusion::ProfilingResult profiling_result);
     int FuseGroupOnGraph(const std::shared_ptr<FusionGroup> group);
+    int SelectBestKernels(const std::shared_ptr<FusionGroup> group);
 
     // Debug string for graph grouping
     std::string DebugStringFuseGroup(std::shared_ptr<FusionGroup> group);
@@ -137,6 +138,7 @@ private:
     std::shared_ptr<cache::KernelCacheManager> m_kernel_db;
     bool m_interplay;   // interplay of intra- and inter- operator scheduling
     int m_fusion_level; // 0: disable, 1: wavefront, 2: wavefront with wave merge
+    std::unordered_set<std::string> m_containedname_blocklist;
 
 private:
     const static size_t DEFAULT_GROUP_ID;

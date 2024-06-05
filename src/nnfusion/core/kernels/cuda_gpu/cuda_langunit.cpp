@@ -2191,3 +2191,25 @@ __device__ __forceinline__ T WARP_SHFL_DOWN(T value, unsigned int delta, int wid
 }
 )",
                  "");
+
+LU_DEFINE(declaration::cuda_prefetch,
+          R"(
+__global__ void prefetch_specfic(const void *__ptr, const std::size_t __nbytes)
+{
+  size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+  char *__p = reinterpret_cast<char *>(const_cast<void *>(__ptr));
+  size_t stride = gridDim.x * blockDim.x * 128;
+
+#pragma unroll
+  for (size_t i = index * 128; i < __nbytes; i += stride)
+  {
+    __asm__ __volatile__("prefetch.global.L2 [%0];" ::"l"(__p + i) :);
+  }
+}
+
+void PreFetchKernel(const void *__ptr, const std::size_t __nbytes, size_t blockcount, size_t threadcount, cudaAccessProperty prop, cudaStream_t stream)
+{
+  prefetch_specfic<<<blockcount, threadcount, 0, stream>>>(__ptr, __nbytes);
+}
+  )");

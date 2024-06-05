@@ -165,6 +165,8 @@ public:
             string op_type = node->get_op_type();
             if (op_type == "Matched_Pattern") op_type = node->get_name();
             nodes.push_back({node->get_id(), str, op_type, edge});
+            NNFUSION_LOG(INFO) << "RegisterFusionOptimizer: " << node->get_name() << " " << node->get_op_type()
+                               << " " << node->get_id() << " " << str << " " << edge.dump();
         }
         auto file = std::ofstream(FLAGS_ftune_output_file);
         file << nodes.dump(/*indent=*/ 2);
@@ -371,7 +373,9 @@ public:
     }
     bool apply(const string &fname) {
         auto fin = std::ifstream(fname, ios::in);
+        NNFUSION_LOG(INFO) << "ApplyFusionResult: " << fname << " try to parse json file.";
         json fusion_groups = json::parse(fin);
+        NNFUSION_LOG(INFO) << "ApplyFusionResult: " << fname << " with " << fusion_groups.size() << " groups.";
         NNFUSION_CHECK(fusion_groups.is_array());
 
         unordered_map<int, shared_ptr<GNode>> id2gnode;
@@ -407,6 +411,9 @@ public:
             for (int i = 0; i < input_desc.size(); i++) {
                 auto node = id2gnode[input_desc[i].first];
                 int in_id = input_desc[i].second;
+                if (in_id >= node->get_inputs().size()) {
+                    NNFUSION_LOG(INFO) << "ApplyFusionResult: " << fname << " invalid input " << in_id << " for node " << node->get_name();
+                }
                 fused_node->set_input(i, node->get_inputs().at(in_id));
                 auto edge = node->get_in_edges()[in_id];
                 m_graph->add_edge(edge->get_src(), edge->get_src_output(), fused_node, i);
@@ -433,6 +440,15 @@ public:
                 nnfusion::get_device_type(FLAGS_fdefault_device.c_str()), make_shared<cuda::FusionCudaEmitter>(ctx, group));
             (*fused_node)["Kernel_Selection_Result_DeviceType"] = FLAGS_fdefault_device.c_str();
             (*fused_node)["Kernel_Selection_Result_json"] = group;
+            auto kernel_result = (*fused_node)["Kernel_Selection_Result"].as<pair<NNFusion_DeviceType, KernelEmitter::Pointer>>();
+            kernel_result.second->KernelEmitter::get_or_emit_source();
+
+            // candidate_results
+            std::vector<json> candidate_results;
+            if (group.contains("candidate_results")) {
+                group["candidate_results"].get_to(candidate_results);
+                (*fused_node)["Kernel_Selection_Candidate_Results"] = candidate_results;
+            }
         }
         return true;
     }

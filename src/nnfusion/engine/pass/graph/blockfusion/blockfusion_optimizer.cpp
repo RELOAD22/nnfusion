@@ -18,11 +18,20 @@ using namespace nnfusion::graph;
 using namespace nnfusion::pass::graph;
 using namespace nnfusion::kernels;
 
+DEFINE_bool(fblockfusion_select,
+            false,
+            "Select the best kernels for BlockFusion, default is true");
+DEFINE_string(ffusion_containedname_blocklist,
+              "",
+              "List of op names that skip kernel tuning pass, e.g., \"Relu_11,Conv_9\"");
+DEFINE_bool(fblockfusion_onlysame,
+            false,
+            "Only fuse the same nodes in BlockFusion, default is false");
 const size_t BlockFusionWavefrontOptimizer::DEFAULT_GROUP_ID = -1;
 size_t BlockFusionWavefrontOptimizer::MAX_GROUP = 128;
 size_t BlockFusionWavefrontOptimizer::DEFAULT_BE = 10240;
 const size_t BlockFusionWavefrontOptimizer::RESOURCE_CAPACITY =
-    4 * 80; // volta max parallelism: 4 * #SM
+    10800; // volta max parallelism: 4 * #SM
 
 BlockFusionWavefrontOptimizer::BlockFusionWavefrontOptimizer(std::shared_ptr<Graph> g,
                                                              std::string _device_type,
@@ -45,6 +54,17 @@ BlockFusionWavefrontOptimizer::BlockFusionWavefrontOptimizer(std::shared_ptr<Gra
     for (size_t i = 0; i < active_gnodes.size(); i++)
     {
         m_active_gnodes_name.insert(active_gnodes[i]->get_name());
+    }
+    {
+        auto blocklist_str = FLAGS_ffusion_containedname_blocklist;
+        stringstream ss(blocklist_str);
+        while (ss.good())
+        {
+            string substr;
+            getline(ss, substr, ',');
+            m_containedname_blocklist.insert(substr);
+        }
+        NNFUSION_LOG(INFO) << "HFusion BlockList(containedname): " << join(m_containedname_blocklist, ", ");
     }
 }
 
@@ -155,6 +175,14 @@ bool BlockFusionWavefrontOptimizer::verify_node(size_t node_id,
         return false;
     }
 
+    for (auto name : m_containedname_blocklist){
+        if (name == "") continue;
+        if (node->get_name().find(name) != std::string::npos){
+            NNFUSION_LOG(NNFUSION_WARNING) << "Op " << node->get_name() << " is not supported in BlockFusionWavefrontOptimizer(m_containedname_blocklist)";
+            return false;
+        }
+    }
+
     // ignore dead gnodes
     if (m_active_gnodes_name.find(node->get_name()) == m_active_gnodes_name.end())
     {
@@ -172,12 +200,12 @@ bool BlockFusionWavefrontOptimizer::verify_node(size_t node_id,
     }
 
     // skip non-emitted kernels
-    if (!emitted_kernel.second->is_emitted())
-    {
-        NNFUSION_LOG(NNFUSION_WARNING) << "Kernel should be emitted before this pass:"
-                                       << node->get_name();
-        return false;
-    }
+    // if (!emitted_kernel.second->is_emitted())
+    // {
+    //     NNFUSION_LOG(NNFUSION_WARNING) << "Kernel should be emitted before this pass:"
+    //                                    << node->get_name();
+    //     return false;
+    // }
 
     if (std::dynamic_pointer_cast<BlockCudaEmitter>(kernel) == nullptr)
     {
@@ -202,6 +230,24 @@ bool BlockFusionWavefrontOptimizer::verify_node(size_t node_id,
         }
     }
 
+    // Only fuse the same nodes
+    if (cur_group->nodes.size() > 0 && FLAGS_fblockfusion_onlysame)
+    {
+        auto prev_node = m_nodes[cur_group->nodes.back()]->node;
+        if (prev_node->get_op_type() != node->get_op_type())
+        {
+            NNFUSION_LOG(INFO) << "BlockFusion: cannot merge group due to different op type";
+            return false;
+        }
+        std::string prev_kernel_name = prev_node->get_name().substr(prev_node->get_name().find("  ") + 1);
+        std::string cur_kernel_name = node->get_name().substr(node->get_name().find("  ") + 1);
+        if (prev_kernel_name != cur_kernel_name)
+        {
+            NNFUSION_LOG(INFO) << "BlockFusion: cannot merge group due to differne node name(without Groupx)";
+            NNFUSION_LOG(INFO) << "  " << prev_node->get_name() << " vs " << node->get_name();
+            return false;
+        }
+    }
     cur_group->nodes.push_back(node_id);
     cur_group->block_kernels.push_back(kernel);
 
@@ -500,7 +546,7 @@ double BlockFusionWavefrontOptimizer::GroupProfiler(const std::shared_ptr<Fusion
 bool BlockFusionWavefrontOptimizer::SkipGroupOnProfilingResult(
     blockfusion::ProfilingResult profiling_result)
 {
-    NNFUSION_LOG(DEBUG) << "profiling result:\n" << profiling_result.get_debug_string();
+    // NNFUSION_LOG(DEBUG) << "profiling result:\n" << profiling_result.get_debug_string();
 
     if (profiling_result.profile_device)
     {
@@ -549,6 +595,152 @@ bool BlockFusionWavefrontOptimizer::SkipGroupOnProfilingResult(
     return false;
 }
 
+int BlockFusionWavefrontOptimizer::SelectBestKernels(const std::shared_ptr<FusionGroup> group)
+{
+    if (group->nodes.size() < 2)
+    {
+        return 0;
+    }
+
+    if (!FLAGS_fblockfusion_select)
+    {
+        for (size_t index = 0; index < group->block_kernels.size(); index++){
+            auto node = m_nodes[group->nodes.at(index)]->node;
+            std::shared_ptr<KernelContext> ctx(new KernelContext(node));
+            NNFUSION_CHECK((*node)["Kernel_Selection_Result"].is_valid() && (*node)["Kernel_Selection_Result_json"].is_valid()) 
+                << "Kernel_Selection_Result is not valid" << node->get_name();
+            auto kernel = std::make_shared<kernels::cuda::FusionCudaEmitter>(ctx, (*node)["Kernel_Selection_Result_json"].as<json>());
+            kernel->emit_block_kernel();
+            group->block_kernels[index] = kernel;
+            group->duration[index] = (float)((*node)["Kernel_Selection_Result_json"].as<json>()["latency"]) * 1000; // ms -> us
+        }
+    }
+    else
+    {
+        float best_total_duration = std::numeric_limits<float>::max();
+
+        for (size_t index = 0; index < group->block_kernels.size(); index++){
+            auto node = m_nodes[group->nodes.at(index)]->node;
+            std::shared_ptr<KernelContext> ctx(new KernelContext(node));
+            NNFUSION_CHECK((*node)["Kernel_Selection_Result"].is_valid() && (*node)["Kernel_Selection_Result_json"].is_valid()) 
+                << "Kernel_Selection_Result is not valid" << node->get_name();
+            auto kernel = std::make_shared<kernels::cuda::FusionCudaEmitter>(ctx, (*node)["Kernel_Selection_Result_json"].as<json>());
+            kernel->emit_block_kernel();
+            group->block_kernels[index] = kernel;
+            group->duration[index] = (float)((*node)["Kernel_Selection_Result_json"].as<json>()["latency"]) * 1000; // ms -> us
+        }
+
+        std::vector<std::shared_ptr<nnfusion::kernels::cuda::FusionCudaEmitter>> best_kernels;
+        std::vector<float> best_durations;
+
+        for (size_t iter = 0; iter < 3; iter++){
+            NNFUSION_LOG(INFO) << "BlockFusion: select best kernels for group " << group->id << ", iter " << iter;
+            for (size_t index = 0; index < group->block_kernels.size(); index++){
+                auto node = m_nodes[group->nodes.at(index)]->node;
+                std::shared_ptr<KernelContext> ctx(new KernelContext(node));
+                NNFUSION_CHECK((*node)["Kernel_Selection_Result"].is_valid() && (*node)["Kernel_Selection_Result_json"].is_valid()) 
+                    << "Kernel_Selection_Result is not valid" << node->get_name();
+                std::shared_ptr<nnfusion::kernels::cuda::FusionCudaEmitter> kernel;
+                if (iter >= 1 && (*node)["Kernel_Selection_Candidate_Results"].is_valid() && (*node)["Kernel_Selection_Candidate_Results"].as<vector<json>>().size() > 0) {
+                    auto candidate_results = (*node)["Kernel_Selection_Candidate_Results"].as<vector<json>>();
+                    // sort(descending order) candidate_results by prod(grid_size)
+                    std::sort(candidate_results.begin(), candidate_results.end(), 
+                        [](const json& a, const json& b) -> bool {
+                            return (int)a["grid_size"][0] * (int)a["grid_size"][1] * (int)a["grid_size"][2] > 
+                                (int)b["grid_size"][0] * (int)b["grid_size"][1] * (int)b["grid_size"][2];
+                        });
+                    size_t candidate_index = min(iter - 1, candidate_results.size() - 1);
+                    kernel = std::make_shared<kernels::cuda::FusionCudaEmitter>(ctx, candidate_results[candidate_index]);
+                    group->duration[index] = (float)(candidate_results[candidate_index]["latency"]) * 1000; // ms -> us
+                    NNFUSION_LOG(INFO) << "BlockFusion: select candidate kernel " << candidate_index 
+                        << " for node " << node->get_name()
+                        << " with latency " << group->duration[index] << "us" << " and grid size "
+                        << vector_to_string(candidate_results[candidate_index]["grid_size"]);
+                }else{
+                    kernel = std::make_shared<kernels::cuda::FusionCudaEmitter>(ctx, (*node)["Kernel_Selection_Result_json"].as<json>());
+                    group->duration[index] = (float)((*node)["Kernel_Selection_Result_json"].as<json>()["latency"]) * 1000; // ms -> us
+                    NNFUSION_LOG(INFO) << "BlockFusion: select default kernel " 
+                        << " for node " << node->get_name()
+                        << " with latency " << group->duration[index] << "us" << " and grid size "
+                        << vector_to_string((*node)["Kernel_Selection_Result_json"].as<json>()["grid_size"]);
+                }
+                kernel->emit_block_kernel();
+                group->block_kernels[index] = kernel;
+            }
+            {
+                auto virtual_device_p =
+                    std::make_shared<BlockParallelDevice>(DEFAULT_BE, BlockKernelSchedulePolicy::RANGE);
+                BlockParallelDevice& virtual_device = *virtual_device_p;
+                std::vector<std::string> nodes_dep;
+
+                for (size_t index = 0; index < group->block_kernels.size(); index++)
+                {
+                    auto kernel = group->block_kernels[index];
+                    // Todo: integrate the interface of profiling result, 10 stands for 10us
+                    auto kernel_metric = std::make_shared<KernelMetric>();
+                    kernel_metric->duration = group->duration[index];
+                    for (auto edge : kernel->m_context->gnode->get_in_edges())
+                    {
+                        if (virtual_device.check_dependency(edge->get_src()->get_unique_name()))
+                        {
+                            nodes_dep.push_back(edge->get_src()->get_unique_name());
+                        }
+                    }
+                    if (m_fusion_level == 2)
+                    {
+                        if (nodes_dep.size() > 0)
+                            virtual_device.schedule_kernel_with_dependency(
+                                std::dynamic_pointer_cast<BlockCudaEmitter>(kernel), nodes_dep);
+                        else
+                            virtual_device.schedule_kernel(std::dynamic_pointer_cast<BlockCudaEmitter>(kernel));
+                    }
+                    else
+                    {
+                        if (nodes_dep.size() > 0)
+                            virtual_device.schedule_kernel_with_dependency(
+                                std::dynamic_pointer_cast<BlockCudaEmitter>(kernel), nodes_dep, kernel_metric);
+                        else
+                            virtual_device.schedule_kernel(std::dynamic_pointer_cast<BlockCudaEmitter>(kernel),
+                                                        kernel_metric);
+                    }
+                    nodes_dep.clear();
+                }
+
+                auto blockfusion_profiler = BlockFusionProfiler();
+                auto code_generator_p = std::make_shared<BlockFusionCudaCodegen>(
+                    std::make_shared<KernelContext>(), virtual_device.get_block_executor_program());
+                BlockFusionCudaCodegen& code_generator = *code_generator_p;
+                auto blockfusion_func = code_generator.get_or_emit_source();
+
+                blockfusion_profiler.set_profiling_context(virtual_device_p, code_generator_p);
+                auto profiling_result = blockfusion_profiler.get_profiling_result();
+                // print result
+                NNFUSION_LOG(DEBUG) << "\n" << profiling_result.get_debug_string();
+
+                if (std::abs(profiling_result.fused_execution_time - (double)0.0) > (double)1e-5){
+                    // valid result
+                    if (profiling_result.fused_execution_time < best_total_duration){
+                        best_total_duration = profiling_result.fused_execution_time;
+                        best_kernels.clear();
+                        best_durations.clear();
+                        for (size_t index = 0; index < group->block_kernels.size(); index++){
+                            best_kernels.push_back(std::dynamic_pointer_cast<nnfusion::kernels::cuda::FusionCudaEmitter>(group->block_kernels[index]));
+                            best_durations.push_back(group->duration[index]);
+                        }
+                        NNFUSION_LOG(INFO) << "BlockFusion: update best kernels with total duration " << best_total_duration;
+                    }
+                }
+            }
+        }
+        NNFUSION_CHECK(best_kernels.size() == group->block_kernels.size()) << "best_kernels.size() != group->block_kernels.size()";
+        for (size_t index = 0; index < group->block_kernels.size(); index++){
+            group->block_kernels[index] = best_kernels[index];
+            group->duration[index] = best_durations[index];
+        }
+    }
+    return 1;
+}
+
 int BlockFusionWavefrontOptimizer::FuseGroupOnGraph(const std::shared_ptr<FusionGroup> group)
 {
     // NNFUSION_LOG(INFO) << DebugStringFuseGroup(group);
@@ -570,27 +762,40 @@ int BlockFusionWavefrontOptimizer::FuseGroupOnGraph(const std::shared_ptr<Fusion
         }
         if (aggregated_resources > RESOURCE_CAPACITY)
         {
-            for (int i = 0; i < group->nodes.size(); i++)
-            {
-                auto node = m_nodes[group->nodes.at(i)]->node;
-                std::shared_ptr<KernelContext> ctx(new KernelContext(node));
-                std::string identifier = ctx->generate_identifier();
-                auto fetched_kernel =
-                    m_kernel_db->fetch_with_tags(identifier, "CUDA_GPU", set<string>{}, true);
-                if (fetched_kernel != nullptr)
-                {
-                    auto kernel =
-                        std::make_shared<kernels::cuda::CacheBlockCudaEmitter>(ctx, fetched_kernel);
-                    kernel->get_or_emit_source();
-                    group->block_kernels[i] = kernel;
-                    group->duration[i] = fetched_kernel->profile[m_device_name];
-                    NNFUSION_LOG(DEBUG) << "fetched kernel " << identifier << " with resource "
-                                        << fetched_kernel->resource << " and profiled on "
-                                        << m_device_name << " in "
-                                        << fetched_kernel->profile[m_device_name] << "us";
-                }
-            }
+            NNFUSION_LOG(INFO) << "BlockFusion:aggregated_resources > RESOURCE_CAPACITY";
+            // for (int i = 0; i < group->nodes.size(); i++)
+            // {
+            //     auto node = m_nodes[group->nodes.at(i)]->node;
+            //     std::shared_ptr<KernelContext> ctx(new KernelContext(node));
+            //     std::string identifier = ctx->generate_identifier();
+            //     auto fetched_kernel =
+            //         m_kernel_db->fetch_with_tags(identifier, "CUDA_GPU", set<string>{}, true);
+            //     if (fetched_kernel != nullptr)
+            //     {
+            //         auto kernel =
+            //             std::make_shared<kernels::cuda::CacheBlockCudaEmitter>(ctx, fetched_kernel);
+            //         kernel->get_or_emit_source();
+            //         group->block_kernels[i] = kernel;
+            //         group->duration[i] = fetched_kernel->profile[m_device_name];
+            //         NNFUSION_LOG(DEBUG) << "fetched kernel " << identifier << " with resource "
+            //                             << fetched_kernel->resource << " and profiled on "
+            //                             << m_device_name << " in "
+            //                             << fetched_kernel->profile[m_device_name] << "us";
+            //     }
+            // }
         }
+
+        // for (size_t index = 0; index < group->block_kernels.size(); index++){
+        //     auto node = m_nodes[group->nodes.at(index)]->node;
+        //     std::shared_ptr<KernelContext> ctx(new KernelContext(node));
+        //     NNFUSION_CHECK((*node)["Kernel_Selection_Result"].is_valid() && (*node)["Kernel_Selection_Result_json"].is_valid()) 
+        //         << "Kernel_Selection_Result is not valid" << node->get_name();
+        //     auto kernel = std::make_shared<kernels::cuda::FusionCudaEmitter>(ctx, (*node)["Kernel_Selection_Result_json"].as<json>());
+        //     kernel->emit_block_kernel();
+        //     group->block_kernels[index] = kernel;
+        //     group->duration[index] = (float)((*node)["Kernel_Selection_Result_json"].as<json>()["latency"]) * 1000; // ms -> us
+        // }
+        SelectBestKernels(group);
     }
 
     for (size_t index = 0; index < group->block_kernels.size(); index++)
@@ -638,8 +843,18 @@ int BlockFusionWavefrontOptimizer::FuseGroupOnGraph(const std::shared_ptr<Fusion
     BlockFusionCudaCodegen& code_generator = *code_generator_p;
     auto blockfusion_func = code_generator.get_or_emit_source();
 
+    FunctionUnit_p fu = code_generator.get_or_emit_source(true);
+    string body_str = fu->body_unit->get_code();
+    string func_name = fu->name_unit->get_code();
+    NNFUSION_LOG(DEBUG) << std::endl << "BlockFusion: " << func_name << " " << body_str;
+
     auto kernel = std::dynamic_pointer_cast<KernelEmitter>(code_generator_p);
     auto ctx = code_generator.get_kernel_context();
+
+    blockfusion_profiler.set_profiling_context(virtual_device_p, code_generator_p);
+    auto profiling_result = blockfusion_profiler.get_profiling_result();
+    // print result
+    NNFUSION_LOG(DEBUG) << "\n" << profiling_result.get_debug_string();
 
     if (m_check_correctness || m_fusion_level >= 2)
     {

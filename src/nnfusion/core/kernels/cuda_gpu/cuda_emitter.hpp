@@ -88,13 +88,22 @@ namespace nnfusion
                 static const std::unordered_map<std::string, size_t> size_of_str_type;
 
                 size_t get_shared_memory_size() { return shared_memory_size; }
+                void reset_shared_memory_size()
+                { 
+                    shared_memory_size = 0; 
+                    shared_memory_log.symbol.clear();
+                    shared_memory_log.dtype.clear();
+                    shared_memory_log.size.clear();
+                }
                 FunctionUnit_p get_or_emit_source(bool emit_func_call = false) override
                 {
                     if (!m_is_emitted)
                     {
+                        // NNFUSION_LOG(INFO) << "Emitting block kernel for " << m_kernel_name;
                         KernelEmitter::get_or_emit_source();
                         bool temp = is_emitting_block_kernel;
                         is_emitting_block_kernel = true;
+                        // NNFUSION_LOG(INFO) << "Emitting(is_emitting_block_kernel TRUE) block kernel for " << m_kernel_name;
                         m_block_function_unit = this->emit_source();
                         is_emitting_block_kernel = temp;
                     }
@@ -140,6 +149,8 @@ namespace nnfusion
                 {
                     if (is_emitting_block_kernel)
                     {
+                        // NNFUSION_LOG(INFO) << "Allocating block shared memory for " << symbol << " in "
+                        //                    << m_kernel_name;
                         lu << type << "* " << symbol << " = (" << type << "*)(shared_buffer + "
                            << shared_memory_size << ");\n";
                         auto iter = size_of_str_type.find(type);
@@ -380,10 +391,13 @@ namespace nnfusion
                 nnfusion::cache::KernelEntry kernel_entry;
             };
 
-            class FusionCudaEmitter : public CudaEmitter
+            class FusionCudaEmitter : public BlockCudaEmitter
             {
             public:
                 FusionCudaEmitter(shared_ptr<KernelContext> ctx, json fusion_group);
+                size_t get_dynamic_smem_size(){
+                    return dynamic_smem_size;
+                }
             private:
                 LanguageUnit_p emit_function_signature() override;
                 LanguageUnit_p emit_function_body() override;
@@ -393,7 +407,9 @@ namespace nnfusion
             private:
                 json m_fusion_group;
                 string m_code;
+                string m_body, m_dep_code;
                 LanguageUnit_p m_body_unitp, m_sig_unitp, m_dep_unitp;
+                size_t dynamic_smem_size;
             };
 
             class CustomCudaKernelEmitter : public BlockCudaEmitter

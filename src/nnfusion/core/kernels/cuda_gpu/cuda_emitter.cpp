@@ -200,7 +200,8 @@ const std::unordered_map<std::string, size_t> cuda::BlockCudaEmitter::size_of_st
     {"uint8_t", sizeof(uint8_t)},
     {"uint16_t", sizeof(uint16_t)},
     {"uint32_t", sizeof(uint32_t)},
-    {"uint64_t", sizeof(uint64_t)}};
+    {"uint64_t", sizeof(uint64_t)},
+    {"half", sizeof(int16_t)}};
 
 LanguageUnit_p cuda::AntaresCudaKernelEmitter::emit_function_body()
 {
@@ -733,7 +734,7 @@ void cuda::CacheBlockCudaEmitter::set_launch_config()
 }
 
 cuda::FusionCudaEmitter::FusionCudaEmitter(shared_ptr<KernelContext> ctx, json fusion_group)
-    : cuda::CudaEmitter(ctx)
+    : cuda::BlockCudaEmitter(ctx)
 {
     m_fusion_group = fusion_group;
     m_fusion_group["code"].get_to(m_code);
@@ -752,11 +753,14 @@ cuda::FusionCudaEmitter::FusionCudaEmitter(shared_ptr<KernelContext> ctx, json f
     int kernel_body_end = m_code.rfind("}") - 1;
     auto body = m_code.substr(kernel_body_start, kernel_body_end - kernel_body_start);
 
+    m_body = body;
+    m_dep_code = m_code.substr(0, kernel_sig_start);
     m_body_unitp = make_shared<LanguageUnit>(old_fname, body);
     m_sig_unitp = make_shared<LanguageUnit>(old_fname + "_sig", sig);
     m_dep_unitp = make_shared<LanguageUnit>(old_fname + "_device_kernel",
         m_code.substr(0, kernel_sig_start));
     // NNFUSION_LOG(INFO) << m_sig_unitp->get_code() << std::endl;
+    dynamic_smem_size = m_fusion_group["dynamic_smem_size"];
 }
 
 void cuda::FusionCudaEmitter::set_launch_config()
@@ -774,8 +778,89 @@ void cuda::FusionCudaEmitter::set_launch_config()
 LanguageUnit_p cuda::FusionCudaEmitter::emit_function_signature() {
     return m_sig_unitp;
 }
-
+#include <regex>
+#include <vector>
 LanguageUnit_p cuda::FusionCudaEmitter::emit_function_body() {
+    // NNFUSION_LOG(INFO) << "FusionCudaEmitter::emit_function_body "
+    //                    << "is_emitting_block_kernel: " << is_emitting_block_kernel;
+    auto old_fname = m_fusion_group["name"].get<string>();
+    m_body_unitp = make_shared<LanguageUnit>(old_fname);
+    m_dep_unitp = make_shared<LanguageUnit>(old_fname + "_device_kernel");
+    auto& lu = *m_body_unitp;
+    std::string cur_body = m_body, cur_dep_code = m_dep_code;
+    if (is_emitting_block_kernel){
+        // replace all shared memory in global kernel body
+        reset_shared_memory_size();
+        while(1){
+            int shared_start = cur_body.find("__shared__");
+            int shared_end = cur_body.find("\n", shared_start);
+            if (shared_start < 0 || shared_end < 0 || shared_end <= shared_start)
+                break;
+            std::string shared_str = cur_body.substr(shared_start, shared_end - shared_start);
+            //remove __shared__ code from str
+            cur_body = cur_body.substr(0, shared_start) + cur_body.substr(shared_end);
+            // parse symbol,type,size from "__shared__ type symbol[size]"
+            std::string type = shared_str.substr(11, shared_str.find(" ", 11) - 11);
+            std::string symbol = shared_str.substr(shared_str.find(" ", 11) + 1,
+                                                    shared_str.find("[", 11) - shared_str.find(" ", 11) - 1);
+            int size = std::stoi(shared_str.substr(shared_str.find("[", 11) + 1,
+                                shared_str.find("]", 11) - shared_str.find("[", 11) - 1));
+            emit_alloc_shared(lu,
+                            symbol,
+                            type,
+                            size);
+        }
+
+        std::vector<std::string> device_fnames;
+        // add new blockid param to device kernel call
+        // Group17_0_Broadcast_Add_Slice_337(input0, input1, (half*)(shared+0), shared+0);
+        // new: Group17_0_Broadcast_Add_Slice_337(input0, input1, (half*)(shared+0), shared+0, blockid);
+        std::regex funcRegex("Group[0-9]+_[0-9]+_[a-zA-Z0-9_]+_[0-9]+\\(.*\\);");
+        std::match_results<std::string::iterator> matches;
+        size_t start = 0;
+        // replace all function call in global kernel body
+        while (std::regex_search(cur_body.begin() + start, cur_body.end(), matches, funcRegex)) {
+            std::string func = matches[0];
+            std::string new_func = func.substr(0, func.size() - 2) + ", block_id);";
+            cur_body = cur_body.replace(start + matches.position(), matches.length(), new_func);
+            start = cur_body.find(new_func) + new_func.size();
+            // get name like: Group17_0_Broadcast_Add_Slice_337
+            device_fnames.push_back(func.substr(0, func.find("(")));
+            // NNFUSION_LOG(INFO) << "FusionCudaEmitter::emit_function_body " << new_func;
+        }
+
+        // add new blockid param to device kernel function
+        for (auto& device_fname : device_fnames){
+            int kernel_sig_start = cur_dep_code.find(device_fname);
+            NNFUSION_CHECK(kernel_sig_start != string::npos);
+            int kernel_sig_end = cur_dep_code.find("{", kernel_sig_start);
+            NNFUSION_CHECK(kernel_sig_end != string::npos);
+            auto sig = cur_dep_code.substr(kernel_sig_start, kernel_sig_end - kernel_sig_start + 1);
+            // find "int __bid = blockIdx.x;" in next line ( < 10)
+            if (cur_dep_code.find("int __bid = blockIdx.x;", kernel_sig_end) < kernel_sig_end + 10)
+            {
+                // remove int __bid = blockIdx.x;
+                int bid_start = cur_dep_code.find("int __bid = blockIdx.x;", kernel_sig_end);
+                int bid_end = cur_dep_code.find("\n", bid_start);
+                cur_dep_code = cur_dep_code.substr(0, bid_start) + cur_dep_code.substr(bid_end);
+                // add blockid param to device kernel function
+                sig = sig.substr(0, sig.size() - 3) + ", int block_id) {\n  int __bid = block_id;";
+            }
+            else
+            {
+                // add blockid param to device kernel function
+                sig = sig.substr(0, sig.size() - 3) + ", int block_id) {\n  const dim3 blockIdx(block_id, 0, 0);";
+            }
+
+            cur_dep_code = cur_dep_code.replace(kernel_sig_start, kernel_sig_end - kernel_sig_start + 1, sig);
+            // NNFUSION_LOG(INFO) << "FusionCudaEmitter::emit_function_body " << sig;
+        }
+        m_dep_unitp = make_shared<LanguageUnit>(old_fname + "_device_kernel_blockid");
+    }
+    auto& lu_dep = *m_dep_unitp;
+
+    lu << cur_body;
+    lu_dep << cur_dep_code;
     return m_body_unitp;
 }
 

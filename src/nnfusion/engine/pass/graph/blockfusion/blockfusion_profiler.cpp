@@ -93,7 +93,7 @@ blockfusion::ProfilingResult BlockFusionProfiler::get_profiling_result()
         profiling_result.num_kernels = device_profiling.num_kernels;
         profiling_result.num_large_kernels = device_profiling.num_large_kernels;
         profiling_result.normal_execution_time = device_profiling.normal_execution_time;
-        profiling_result.fused_estimation_time = device_profiling.fused_estimation_time;
+        profiling_result.fused_estimation_time = 0;
     }
     else
     {

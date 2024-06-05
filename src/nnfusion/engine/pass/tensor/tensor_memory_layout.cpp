@@ -21,6 +21,7 @@ using namespace nnfusion::kernels;
 
 DEFINE_bool(fmem_trace, false, "Record and dump memory trace.");
 DEFINE_string(fmem_log_path, "memory.log", "The file path of memory log.");
+DEFINE_string(fmemgraph_log_path, "memory_graph.log", "The file path of memory graph log.");
 DECLARE_string(fhlsl_codegen_type);
 DECLARE_bool(fextern_result_memory);
 DECLARE_bool(fhost_entry);
@@ -30,11 +31,14 @@ bool AssignTensorMemoryLayout::run(std::shared_ptr<InterpreterContext> ctx,
 {
     bool dump_trace = FLAGS_fmem_trace;
     string mem_log_path = tu->m_graph->get_name() + "_" + FLAGS_fmem_log_path;
-
+    string mem_graph_log_path = tu->m_graph->get_name() + "_" + FLAGS_fmemgraph_log_path;
+    
     // Open memory log file.
-    std::ofstream mem_log;
-    if (dump_trace)
+    std::ofstream mem_log, mem_graph_log;
+    if (dump_trace){
         mem_log.open(mem_log_path);
+        mem_graph_log.open(mem_graph_log_path);
+    }
 
     NNFUSION_CHECK(tu->memory_allocator_factory == nullptr);
     tu->memory_allocator_factory =
@@ -169,6 +173,47 @@ bool AssignTensorMemoryLayout::run(std::shared_ptr<InterpreterContext> ctx,
                     allocator.second->dump(mem_log);
                 }
                 mem_log << "\n";
+
+                // print current gnode's tensor
+                if (gnode && !gnode->is_constant() && !gnode->is_parameter() && !gnode->is_variable())
+                {
+                    mem_graph_log << "Node: " << gnode->get_name() << "\n";
+                    if (ins->getKernel())
+                    {
+                        mem_graph_log << "Kernel: " << ins->getKernel()->get_function_name() << "\n";
+                    }
+
+                    // input tensors
+                    mem_graph_log << "Input: \n";
+                    size_t total_input_size = 0, total_output_size = 0;
+                    for (size_t i = 0; i < gnode->get_input_size(); i++)
+                    {
+                        auto tensor = gnode->get_input_tensor_ptr(i);
+                        mem_graph_log << "  ";
+                        mem_graph_log << tensor->get_name() << " ";
+                        mem_graph_log << tensor->get_pool() << " ";
+                        mem_graph_log << tensor->get_pool_offset() << " ";
+                        mem_graph_log << tensor->size() << "\n";
+                        total_input_size += tensor->size();
+                    }
+                    // output tensors
+                    mem_graph_log << "Output: \n";
+                    for (size_t i = 0; i < gnode->get_output_size(); i++)
+                    {
+                        auto tensor = gnode->get_output_tensor_ptr(i);
+                        mem_graph_log << "  ";
+                        mem_graph_log << tensor->get_name() << " ";
+                        mem_graph_log << tensor->get_pool() << " ";
+                        mem_graph_log << tensor->get_pool_offset() << " ";
+                        mem_graph_log << tensor->size() << "\n";
+                        total_output_size += tensor->size();
+                    }
+                    mem_graph_log << total_input_size << "->" << total_output_size
+                                  << " (bytes)\n";
+                    mem_graph_log << total_input_size / 1024.0 / 1024.0 << "->"
+                                  << total_output_size / 1024.0 / 1024.0 << " (MB)\n";
+                    mem_graph_log << "\n";
+                }
             }
 
             (*ins)["MemoryInfo"] = mem_info;
@@ -179,6 +224,7 @@ bool AssignTensorMemoryLayout::run(std::shared_ptr<InterpreterContext> ctx,
     {
         // close memory log file.
         mem_log.close();
+        mem_graph_log.close();
     }
     NNFUSION_LOG(INFO) << "---------------Tensor memory layout pass done.";
     return true;
