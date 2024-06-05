@@ -14,7 +14,7 @@ REGISTER_OP(BatchNormInference)
         auto output_shape_0 = curr->get_output_shape(0);
 
         NNFUSION_CHECK(output_shape_0 == input_shape_2);
-        NNFUSION_CHECK(output_shape_0.size() == 4);
+        // NNFUSION_CHECK(output_shape_0.size() == 4);
         NNFUSION_CHECK(input_shape_0 == input_shape_1);
         NNFUSION_CHECK(input_shape_3 == input_shape_4);
         NNFUSION_CHECK(input_shape_0 == input_shape_3);
@@ -25,9 +25,24 @@ REGISTER_OP(BatchNormInference)
         string dtype;
         NNFUSION_CHECK(element::Type::nnfusion_element_type_to_dtype_string(curr->get_element_type(), dtype));
         auto epsilon = "const(" + std::to_string(op->get_eps_value()) + ").cast(`" + dtype + "`)";
-        auto expression =
+        string expression;
+        if (output_shape_0.size() == 4)
+        {
+            expression =
             "@output0@[N, C, H, W] = @input1@[C] + @input0@[C] * (@input2@[N, C, H, W] - "
             "@input3@[C]) / (" +
             epsilon + " + @input4@[C]).call(`sqrt`);";
+        }
+        else if (output_shape_0.size() == 2)
+        {
+            expression =
+            "@output0@[N, C] = @input1@[C] + @input0@[C] * (@input2@[N, C] - "
+            "@input3@[C]) / (" +
+            epsilon + " + @input4@[C]).call(`sqrt`);";
+        }
+        else
+        {
+            NNFUSION_CHECK_FAIL() << "BatchNormInference only support 2D and 4D input.";
+        }
         return expression;
     });

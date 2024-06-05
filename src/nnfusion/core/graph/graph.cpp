@@ -101,7 +101,7 @@ std::shared_ptr<GNode> Graph::add_node_and_edge(const std::shared_ptr<nnfusion::
 void Graph::add_gnode_and_edge(const std::shared_ptr<GNode> gnode,
                                const GNodeIndexVector& input_gnodes)
 {
-    NNFUSION_CHECK(gnode == nullptr) << "GNode can't be nullptr.";
+    NNFUSION_CHECK(gnode != nullptr) << "GNode can't be nullptr.";
 
     add_node(gnode);
 
